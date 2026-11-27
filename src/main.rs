@@ -9,8 +9,10 @@ pub struct Config {
     lazy: Option<bool>,
     /// 0.0.0.0 or 127.0.0.1 [Default: false]
     public: Option<bool>,
-    /// Set the port number
+    /// HTTP listening port.
     start_port: Option<u16>,
+    /// Local browser port. Setting this enables SSH forwarding mode.
+    local_port: Option<u16>,
 }
 
 #[tokio::main]

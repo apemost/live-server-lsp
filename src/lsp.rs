@@ -1,21 +1,22 @@
 use rusty_live_server::{Dir, Error, File, FileSystemInterface, Signal};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs::{read_dir, File as TokioFile, ReadDir};
 use tokio::io::AsyncReadExt;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{watch, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tower_lsp::lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionResponse, Command,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, ExecuteCommandParams, InitializeParams, InitializeResult,
-    InitializedParams, MessageType, Position, SaveOptions, ServerCapabilities,
+    InitializedParams, MessageType, Position, SaveOptions, ServerCapabilities, ShowDocumentParams,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
     TextDocumentSyncSaveOptions, Url,
 };
 
+use tower_lsp::jsonrpc::Error as LspError;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::Config;
@@ -23,10 +24,17 @@ use crate::Config;
 struct Backend {
     port: Arc<RwLock<u16>>,
     public: Arc<RwLock<bool>>,
+    remote_preview: RwLock<Option<RemotePreview>>,
     eager: Arc<RwLock<bool>>,
     client: Client,
     threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
     workspace_folders: Arc<Mutex<HashMap<PathBuf, (String, LspFileService)>>>,
+}
+
+#[derive(Clone)]
+struct RemotePreview {
+    local_port: u16,
+    listener: watch::Sender<Option<Result<(), String>>>,
 }
 
 #[derive(Clone)]
@@ -160,40 +168,65 @@ impl LanguageServer for Backend {
         &self,
         params: ExecuteCommandParams,
     ) -> tower_lsp::jsonrpc::Result<Option<Value>> {
-        if params.command == "openProjectWeb" {
-            let mut args = params.arguments.iter();
-            if let (Some(project), Some(file)) = (
-                args.next().and_then(|arg| arg.as_str()),
-                args.next().and_then(|arg| arg.as_str()),
-            ) {
-                if let Some((_, v)) = self.workspace_folders.lock().await.get(Path::new(project)) {
-                    let file = make_file_url_path(Path::new(project), Path::new(file));
-                    if let Err(e) = webbrowser::open(&format!(
-                        "http://127.0.0.1:{}/{file}",
-                        v.port.lock().await
-                    )) {
-                        self.client
-                            .show_message(
-                                MessageType::WARNING,
-                                format!("failed to open browser {}", e.to_string()),
-                            )
-                            .await;
-                        return Err(tower_lsp::jsonrpc::Error::invalid_params(
-                            "failed to open browser",
-                        ));
-                    }
-                } else {
-                    return Err(tower_lsp::jsonrpc::Error::invalid_params(
-                        "URL argument invalid",
-                    ));
-                }
-            } else {
-                return Err(tower_lsp::jsonrpc::Error::invalid_params(
-                    "URL argument missing",
-                ));
+        if params.command != "openProjectWeb" {
+            return Err(LspError::method_not_found());
+        }
+
+        let [project, file, ..] = params.arguments.as_slice() else {
+            return Err(LspError::invalid_params("URL argument missing"));
+        };
+        let (Some(project), Some(file)) = (project.as_str(), file.as_str()) else {
+            return Err(LspError::invalid_params("URL argument missing"));
+        };
+        let project = Path::new(project);
+        let file = Path::new(file);
+        let remote_port = self
+            .workspace_folders
+            .lock()
+            .await
+            .get(project)
+            .map(|(_, service)| service.port.clone())
+            .ok_or_else(|| LspError::invalid_params("URL argument invalid"))?;
+
+        let remote_preview = self.remote_preview.read().await.clone();
+        if let Some(preview) = remote_preview {
+            let url = remote_preview_url(preview.local_port, file)?;
+            let mut listener = preview.listener.subscribe();
+            let status = listener
+                .wait_for(Option::is_some)
+                .await
+                .map_err(|_| preview_error("LiveServer stopped before opening the preview"))?
+                .as_ref()
+                .expect("listener status is set")
+                .clone();
+            status.map_err(preview_error)?;
+
+            let request = ShowDocumentParams {
+                uri: url.clone(),
+                external: Some(true),
+                take_focus: None,
+                selection: None,
+            };
+            if !matches!(self.client.show_document(request).await, Ok(true)) {
+                let message =
+                    format!("Could not open the preview in the client. Open {url} manually.");
+                self.client
+                    .show_message(MessageType::WARNING, &message)
+                    .await;
+                return Err(preview_error(message));
             }
         } else {
-            return Err(tower_lsp::jsonrpc::Error::method_not_found());
+            let file = make_file_url_path(project, file);
+            let port = *remote_port.lock().await;
+            if let Err(error) = webbrowser::open(&format!("http://127.0.0.1:{port}/{file}")) {
+                self.client
+                    .show_message(
+                        MessageType::WARNING,
+                        format!("failed to open browser {error}"),
+                    )
+                    .await;
+                return Err(LspError::invalid_params("failed to open browser"));
+            }
         }
         Ok(None)
     }
@@ -202,11 +235,40 @@ impl LanguageServer for Backend {
         &self,
         params: InitializeParams,
     ) -> tower_lsp::jsonrpc::Result<InitializeResult> {
-        let config: Config = params
-            .initialization_options
-            .map(serde_json::from_value)
-            .and_then(|v| v.ok())
-            .unwrap_or_default();
+        let options = params.initialization_options.unwrap_or_default();
+        let ssh_preview = options
+            .get("local_port")
+            .is_some_and(|value| !value.is_null());
+        let config: Config = match serde_json::from_value(options) {
+            Ok(config) => config,
+            Err(error) if ssh_preview => {
+                return Err(LspError::invalid_params(format!(
+                    "Invalid SSH preview options: {error}"
+                )));
+            }
+            Err(_) => Config::default(),
+        };
+        if let Some(local_port) = config.local_port {
+            if local_port == 0 || config.start_port == Some(0) {
+                return Err(LspError::invalid_params(
+                    "SSH preview ports must be nonzero",
+                ));
+            }
+            if config.public == Some(true) {
+                return Err(LspError::invalid_params(
+                    "SSH preview requires loopback binding",
+                ));
+            }
+            if params.workspace_folders.as_ref().map_or(0, Vec::len) != 1 {
+                return Err(LspError::invalid_params(
+                    "SSH preview requires one workspace folder",
+                ));
+            }
+            *self.remote_preview.write().await = Some(RemotePreview {
+                local_port,
+                listener: watch::channel(None).0,
+            });
+        }
         {
             *self.eager.write().await = !config.lazy.unwrap_or_default();
             *self.port.write().await = config.start_port.unwrap_or(57391);
@@ -290,7 +352,10 @@ impl LanguageServer for Backend {
         };
 
         if let Some((_, service)) = self.get_workspace_for_file(&file_path).await {
-            let port = *service.port.lock().await;
+            let port = match self.remote_preview.read().await.as_ref() {
+                Some(preview) => preview.local_port,
+                None => *service.port.lock().await,
+            };
             let relative_path = file_path.strip_prefix(&*service.root).unwrap_or(&file_path);
             let action = CodeActionOrCommand::CodeAction(CodeAction {
                 title: format!("Open in Browser({})", port),
@@ -321,7 +386,19 @@ impl LanguageServer for Backend {
             .await;
         let folders = self.workspace_folders.lock().await;
         let mut threads = vec![];
+        let remote_preview = self.remote_preview.read().await.clone();
         for (path, (name, fs)) in folders.iter() {
+            if let Some(preview) = &remote_preview {
+                let port = *fs.port.lock().await;
+                threads.push(tokio::spawn(serve_forwarded(
+                    path.clone(),
+                    port,
+                    fs.clone(),
+                    preview.listener.clone(),
+                    self.client.clone(),
+                )));
+                continue;
+            }
             let path = path.clone();
             let f = fs.clone();
             let public = *self.public.read().await;
@@ -363,6 +440,11 @@ impl LanguageServer for Backend {
 
     async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
         self.threads.lock().await.iter().for_each(|v| v.abort());
+        if let Some(preview) = self.remote_preview.read().await.as_ref() {
+            preview
+                .listener
+                .send_replace(Some(Err("LiveServer has stopped".into())));
+        }
         Ok(())
     }
 }
@@ -418,6 +500,57 @@ impl Backend {
         if let Some((_, fs)) = mutex.get(workspace) {
             fs.sig.send_signal(file_path.to_path_buf());
         }
+    }
+}
+
+async fn serve_forwarded(
+    root: PathBuf,
+    port: u16,
+    service: LspFileService,
+    listener: watch::Sender<Option<Result<(), String>>>,
+    client: Client,
+) {
+    let server = rusty_live_server::serve(root, port, false, Some(service.sig.clone()), service);
+    tokio::pin!(server);
+
+    // The pinned server binds numeric loopback before yielding in accept.
+    // Recheck this when upgrading it, or switch to an explicit bind notification.
+    let result = tokio::select! {
+        biased;
+        result = &mut server => result,
+        () = std::future::ready(()) => {
+            listener.send_replace(Some(Ok(())));
+            server.await
+        }
+    };
+    let message = match result {
+        Err(Error::Io(error)) => format!("LiveServer failed on 127.0.0.1:{port}: {error}"),
+        Ok(()) => format!("LiveServer stopped on 127.0.0.1:{port}"),
+    };
+    listener.send_replace(Some(Err(message.clone())));
+    client.show_message(MessageType::ERROR, message).await;
+}
+
+fn remote_preview_url(port: u16, file: &Path) -> Result<Url, LspError> {
+    if file.as_os_str().is_empty()
+        || file
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(LspError::invalid_params(
+            "Expected a workspace-relative file path",
+        ));
+    }
+
+    let path = encode_url_path(file);
+    Url::parse(&format!("http://127.0.0.1:{port}/{path}"))
+        .map_err(|_| LspError::invalid_params("Invalid preview URL"))
+}
+
+fn preview_error(message: impl Into<std::borrow::Cow<'static, str>>) -> LspError {
+    LspError {
+        message: message.into(),
+        ..LspError::internal_error()
     }
 }
 
@@ -479,6 +612,7 @@ pub async fn lsp() {
         threads: Default::default(),
         port: Default::default(),
         public: Default::default(),
+        remote_preview: Default::default(),
         eager: Arc::new(RwLock::new(true)),
     })
     .finish();
@@ -565,28 +699,45 @@ mod tests {
 
     #[test]
     fn makes_relative_url_path_for_file_under_workspace() {
-        let root = Path::new(r"C:\Users\PC021\Desktop");
-        let file = Path::new(r"C:\Users\PC021\Desktop\index.html");
+        let root = Path::new("workspace");
+        let file = root.join("index.html");
 
-        assert_eq!(make_file_url_path(root, file), "index.html");
+        assert_eq!(make_file_url_path(root, &file), "index.html");
     }
 
     #[test]
     fn encodes_unicode_and_reserved_characters() {
-        let root = Path::new(r"C:\Users\PC021\Desktop");
-        let file = Path::new(r"C:\Users\PC021\Desktop\index_切圖_模板 #1.html");
+        let root = Path::new("workspace");
+        let file = root.join("index_切圖_模板 #1.html");
 
         assert_eq!(
-            make_file_url_path(root, file),
+            make_file_url_path(root, &file),
             "index_%E5%88%87%E5%9C%96_%E6%A8%A1%E6%9D%BF%20%231.html"
         );
     }
 
     #[test]
     fn preserves_nested_relative_path_with_forward_slashes() {
-        let root = Path::new(r"C:\Users\PC021");
-        let file = Path::new(r"C:\Users\PC021\Desktop\demo file.html");
+        let root = Path::new("workspace");
+        let file = root.join("Desktop").join("demo file.html");
 
-        assert_eq!(make_file_url_path(root, file), "Desktop/demo%20file.html");
+        assert_eq!(make_file_url_path(root, &file), "Desktop/demo%20file.html");
+    }
+
+    #[test]
+    fn remote_url_uses_the_forwarded_port_and_encodes_the_path() {
+        let file = Path::new("examples").join("报告 #1.html");
+
+        assert_eq!(
+            remote_preview_url(57390, &file).unwrap().as_str(),
+            "http://127.0.0.1:57390/examples/%E6%8A%A5%E5%91%8A%20%231.html"
+        );
+    }
+
+    #[test]
+    fn remote_url_requires_a_workspace_relative_file_path() {
+        assert!(remote_preview_url(57390, Path::new("../index.html")).is_err());
+        assert!(remote_preview_url(57390, Path::new("/index.html")).is_err());
+        assert!(remote_preview_url(57390, Path::new("")).is_err());
     }
 }
